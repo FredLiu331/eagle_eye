@@ -76,6 +76,10 @@ int main() {
   // [修改] 主循环抓取多帧
   int drop_frames_count = DROP_FRAMES;
   uint64_t frame_count = 0;
+  uint64_t last_pts_us = 0;
+  uint64_t send_fail_count = 0;
+  uint64_t capture_err_count = 0;
+  uint64_t bad_pts_count = 0;
   while (true) {
     struct v4l2_buffer dqbuf = {};
     struct v4l2_plane dqplanes[1] = {};
@@ -86,9 +90,15 @@ int main() {
 
     ioctl(cam_fd, VIDIOC_DQBUF, &dqbuf);
     int isp_idx = dqbuf.index;
+    uint64_t v4l2_pts_us = static_cast<uint64_t>(dqbuf.timestamp.tv_sec) *
+                               1000000ULL +
+                           static_cast<uint64_t>(dqbuf.timestamp.tv_usec);
     if (dqbuf.flags & V4L2_BUF_FLAG_ERROR) {
-      std::cout << "\r[WARNING] ISP returned a corrupted frame, skipping..."
-                << std::flush;
+      capture_err_count++;
+      if ((capture_err_count % 30) == 1) {
+        std::cout << "\n[WARN] ISP corrupted frames: " << capture_err_count
+                  << std::endl;
+      }
       // 把坏的 Buffer 原样还给 V4L2 继续采集，直接跳入下一次循环
       dqbuf.m.planes[0].m.fd = ispPool.getBuffer(isp_idx).fd;
       dqbuf.m.planes[0].length = ispPool.getBuffer(isp_idx).size;
@@ -97,7 +107,6 @@ int main() {
     }
     if (drop_frames_count > 0) {
       // 跳过前几帧让曝光稳定
-      std::cout << "\r[INFO] Dropping warm-up frame..." << std::flush;
       drop_frames_count--;
     } else {
       // 正常处理流程
@@ -117,14 +126,36 @@ int main() {
           (void)encoder.forceIdr();
         }
 
-        // [步骤 B] 构造平滑 PTS 并进行 MPP H.265 编码
-        uint64_t perfect_pts = frame_count * 33333ULL;
+        // [步骤 B] 使用 V4L2 硬件捕获时间戳进行 MPP H.265 编码
         std::vector<uint8_t> h265_nalu =
-            encoder.encode(rga_out_fd, rga_out_size, perfect_pts);
+            encoder.encode(rga_out_fd, rga_out_size, v4l2_pts_us);
 
         if (!h265_nalu.empty()) {
           // [步骤 C] 将 H.265 码流推送到 WebRTC 网络！
-          streamer.pushFrame(h265_nalu);
+          if (!streamer.pushFrame(h265_nalu, v4l2_pts_us)) {
+            send_fail_count++;
+          }
+
+          if (last_pts_us != 0) {
+            uint64_t delta_pts_us = v4l2_pts_us - last_pts_us;
+            // 30fps 理论间隔约 33333us，允许一定抖动
+            if (delta_pts_us < 20000 || delta_pts_us > 50000) {
+              bad_pts_count++;
+              if ((bad_pts_count % 20) == 1) {
+                std::cout << "\n[WARN] Abnormal capture PTS delta: " << delta_pts_us
+                          << " us (count=" << bad_pts_count << ")" << std::endl;
+              }
+            }
+          }
+          last_pts_us = v4l2_pts_us;
+
+          if ((frame_count % 300) == 0) {
+            std::cout << "\n[INFO] frame=" << frame_count
+                      << " send_fail=" << send_fail_count
+                      << " cap_err=" << capture_err_count
+                      << " bad_pts=" << bad_pts_count
+                      << " nalu_bytes=" << h265_nalu.size() << std::endl;
+          }
         }
         frame_count++;
       }

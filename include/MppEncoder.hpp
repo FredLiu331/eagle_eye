@@ -4,7 +4,6 @@
 #include <vector>
 #include <rockchip/rk_mpi.h>
 #include <rockchip/rk_venc_cmd.h>
-#include <rockchip/mpp_meta.h>
 #include <rockchip/mpp_buffer.h>
 #include <rockchip/mpp_frame.h>
 #include <rockchip/mpp_packet.h>
@@ -66,10 +65,11 @@ public:
         mpp_enc_cfg_set_s32(cfg, "rc:bps_target", bps); // 目标码率 (默认 2Mbps)
         mpp_enc_cfg_set_s32(cfg, "rc:bps_max", bps * 1.2);
         mpp_enc_cfg_set_s32(cfg, "rc:bps_min", bps * 0.8);
-
+        mpp_enc_cfg_set_s32(cfg, "rc:hier_p_en", 0);
+        mpp_enc_cfg_set_s32(cfg, "codec:profile", 1);
         // 编码质量配置：HEVC + 短 GOP，减少首帧等待并提升 WebRTC 追帧速度
         mpp_enc_cfg_set_s32(cfg, "codec:type", MPP_VIDEO_CodingHEVC);
-        mpp_enc_cfg_set_s32(cfg, "rc:gop", fps / 2 > 0 ? fps / 2 : 15);
+        mpp_enc_cfg_set_s32(cfg, "rc:gop", fps);
 
         int ret = m_mpi->control(m_ctx, MPP_ENC_SET_CFG, cfg);
         mpp_enc_cfg_deinit(cfg);
@@ -86,20 +86,6 @@ public:
             std::cerr << "[WARNING] EagleEye: Failed to set MPP header mode EACH_IDR." << std::endl;
         }
 
-        std::vector<uint8_t> hdr_buf(16 * 1024);
-        MppPacket hdr_pkt = nullptr;
-        if (mpp_packet_init(&hdr_pkt, hdr_buf.data(), hdr_buf.size()) == MPP_OK) {
-            mpp_packet_set_length(hdr_pkt, 0);
-            if (m_mpi->control(m_ctx, MPP_ENC_GET_HDR_SYNC, hdr_pkt) == MPP_OK) {
-                void *ptr = mpp_packet_get_pos(hdr_pkt);
-                size_t len = mpp_packet_get_length(hdr_pkt);
-                if (ptr && len > 0) {
-                    m_header.assign((uint8_t *)ptr, (uint8_t *)ptr + len);
-                    std::cout << "[INFO] EagleEye: Extracted H.265 Header (" << len << " bytes)." << std::endl;
-                }
-            }
-            mpp_packet_deinit(&hdr_pkt);
-        }
         std::cout << "[INFO] EagleEye: MPP H.265 Encoder Initialized (" << width << "x" << height << ", "
                   << bps / 1000 << "kbps)." << std::endl;
         return true;
@@ -140,8 +126,7 @@ public:
             std::cerr << "[ERROR] EagleEye: MPP encode_put_frame failed." << std::endl;
         }
 
-        // 2. 获取编码后的数据包（兼容 split/partition 输出，直到一帧结束）
-        bool header_injected = false;
+        // 2. 获取编码后的数据包（极简纯净拼装，直到一帧结束）
         while (true) {
             MppPacket packet = nullptr;
             if (m_mpi->encode_get_packet(m_ctx, &packet) != MPP_OK || !packet) {
@@ -153,39 +138,16 @@ public:
             bool is_partition = mpp_packet_is_partition(packet) != 0;
             bool is_eoi = mpp_packet_is_eoi(packet) != 0;
 
-            int is_intra = 0;
-            if (mpp_packet_has_meta(packet)) {
-                MppMeta meta = mpp_packet_get_meta(packet);
-                if (meta) {
-                    (void)mpp_meta_get_s32(meta, KEY_OUTPUT_INTRA, &is_intra);
-                }
+            if (ptr && len > 0) {
+                std::vector<uint8_t> chunk((uint8_t *)ptr, (uint8_t *)ptr + len);
+                encoded_data.insert(encoded_data.end(), chunk.begin(), chunk.end());
             }
-
-            std::vector<uint8_t> chunk((uint8_t *)ptr, (uint8_t *)ptr + len);
-            bool has_start_code = hasAnnexBStartCode(chunk.data(), chunk.size());
-            bool converted = false;
-            if (!has_start_code) {
-                converted = convertLengthPrefixedToAnnexB(chunk);
-                has_start_code = hasAnnexBStartCode(chunk.data(), chunk.size());
-            }
-
-            // 兜底：如果该帧是关键帧且当前 chunk 内没带 VPS/SPS/PPS，则手工补头
-            if (is_intra && !m_header.empty() && !hasHevcParamSets(chunk) && !header_injected) {
-                encoded_data.insert(encoded_data.end(), m_header.begin(), m_header.end());
-                header_injected = true;
-            }
-            encoded_data.insert(encoded_data.end(), chunk.begin(), chunk.end());
 
             if (m_encode_count < m_debug_log_limit) {
-                int first_type = firstHevcNalType(chunk);
                 std::cout << "[DEBUG] MPP packet#" << m_encode_count
                           << " len=" << len
-                          << " intra=" << is_intra
                           << " partition=" << is_partition
                           << " eoi=" << is_eoi
-                          << " annexb=" << has_start_code
-                          << " converted=" << converted
-                          << " firstNalType=" << first_type
                           << std::endl;
             }
 
@@ -208,96 +170,10 @@ public:
     }
 
 private:
-    static bool hasAnnexBStartCode(const uint8_t *data, size_t len) {
-        if (!data || len < 3) return false;
-        for (size_t i = 0; i + 3 < len; ++i) {
-            if (data[i] == 0x00 && data[i + 1] == 0x00 &&
-                ((data[i + 2] == 0x01) || (i + 3 < len && data[i + 2] == 0x00 && data[i + 3] == 0x01))) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    static bool convertLengthPrefixedToAnnexB(std::vector<uint8_t> &data) {
-        if (data.size() < 8) return false;
-        std::vector<uint8_t> out;
-        out.reserve(data.size() + 64);
-
-        size_t off = 0;
-        while (off + 4 <= data.size()) {
-            uint32_t nalu_len = (uint32_t(data[off]) << 24) |
-                                (uint32_t(data[off + 1]) << 16) |
-                                (uint32_t(data[off + 2]) << 8) |
-                                uint32_t(data[off + 3]);
-            off += 4;
-            if (nalu_len == 0 || off + nalu_len > data.size()) {
-                return false;
-            }
-            out.push_back(0x00);
-            out.push_back(0x00);
-            out.push_back(0x00);
-            out.push_back(0x01);
-            out.insert(out.end(), data.begin() + off, data.begin() + off + nalu_len);
-            off += nalu_len;
-        }
-
-        if (off != data.size()) return false;
-        data.swap(out);
-        return true;
-    }
-
-    static int firstHevcNalType(const std::vector<uint8_t> &data) {
-        if (data.size() < 6) return -1;
-        for (size_t i = 0; i + 5 < data.size(); ++i) {
-            if (data[i] == 0x00 && data[i + 1] == 0x00) {
-                size_t hdr = i;
-                if (data[i + 2] == 0x01) {
-                    hdr = i + 3;
-                } else if (data[i + 2] == 0x00 && data[i + 3] == 0x01) {
-                    hdr = i + 4;
-                } else {
-                    continue;
-                }
-                if (hdr + 1 < data.size()) {
-                    return int((data[hdr] >> 1) & 0x3f);
-                }
-            }
-        }
-        return -1;
-    }
-
-    static bool hasHevcParamSets(const std::vector<uint8_t> &data) {
-        // VPS=32, SPS=33, PPS=34
-        bool vps = false, sps = false, pps = false;
-        if (data.size() < 6) return false;
-
-        for (size_t i = 0; i + 5 < data.size(); ++i) {
-            if (data[i] == 0x00 && data[i + 1] == 0x00) {
-                size_t hdr = i;
-                if (data[i + 2] == 0x01) {
-                    hdr = i + 3;
-                } else if (data[i + 2] == 0x00 && data[i + 3] == 0x01) {
-                    hdr = i + 4;
-                } else {
-                    continue;
-                }
-                if (hdr + 1 >= data.size()) continue;
-                int t = int((data[hdr] >> 1) & 0x3f);
-                if (t == 32) vps = true;
-                if (t == 33) sps = true;
-                if (t == 34) pps = true;
-                if (vps && sps && pps) return true;
-            }
-        }
-        return false;
-    }
-
     MppCtx m_ctx;
     MppApi *m_mpi;
     int m_width;
     int m_height;
-    std::vector<uint8_t> m_header;
     uint64_t m_encode_count;
     uint64_t m_debug_log_limit;
 };

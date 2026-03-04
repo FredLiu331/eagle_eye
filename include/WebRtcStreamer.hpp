@@ -67,7 +67,7 @@ public:
                 });
 
                 pc->onStateChange([](rtc::PeerConnection::State state) {
-                    std::cout << "[INFO] EagleEye: WebRTC State -> " << state << std::endl;
+                    std::cout << "[INFO] EagleEye: WebRTC state -> " << state << std::endl;
                 });
 
                 // 只要本地 SDP 生成好，立刻作为 Offer 发给浏览器
@@ -122,7 +122,8 @@ public:
     }
 
     // 将 VPU 编码出的 H.265 NALU 发送给浏览器
-    void pushFrame(const std::vector<uint8_t>& nalu) {
+    // 关键：为每帧设置正确的 RTP timestamp，避免浏览器抖动缓冲/播放时钟异常
+    bool pushFrame(const std::vector<uint8_t>& nalu, uint64_t pts_us) {
         // static FILE* fp_debug = fopen("/tmp/webrtc_debug.h265", "wb");
         // if (fp_debug && !nalu.empty()) fwrite(nalu.data(), 1, nalu.size(), fp_debug);
         
@@ -132,9 +133,34 @@ public:
             track = m_video_track;
         }
 
-        if (track && track->isOpen() && !nalu.empty()) {
-            track->send(reinterpret_cast<const std::byte*>(nalu.data()), nalu.size());
+        if (!track || !track->isOpen() || nalu.empty()) {
+            return false;
         }
+
+        // H.265 视频 RTP 时钟频率固定 90kHz
+        static constexpr uint64_t kVideoClock = 90000ULL;
+        static constexpr uint64_t kUsPerSecond = 1000000ULL;
+        const uint32_t rtp_ts = static_cast<uint32_t>((pts_us * kVideoClock) / kUsPerSecond);
+        track->sendFrame(reinterpret_cast<const std::byte*>(nalu.data()),
+                         nalu.size(),
+                         rtc::FrameInfo(rtp_ts));
+
+        if (m_sent_frames > 0) {
+            const uint32_t rtp_step = rtp_ts - m_last_rtp_ts;
+            // 30fps 对应步长约 3000
+            if (rtp_step < 1500 || rtp_step > 4500) {
+                m_rtp_anomaly_count++;
+                if ((m_rtp_anomaly_count % 20) == 1) {
+                    std::cout << "[WARN] EagleEye: RTP timestamp step abnormal: "
+                              << rtp_step << " ticks (count=" << m_rtp_anomaly_count
+                              << ")" << std::endl;
+                }
+            }
+        }
+        m_last_rtp_ts = rtp_ts;
+        m_sent_frames++;
+
+        return true;
     }
 
     bool consumeKeyframeRequest() {
@@ -147,6 +173,9 @@ private:
     std::shared_ptr<rtc::Track> m_video_track;
     std::mutex m_track_mutex;
     std::atomic<bool> m_need_keyframe{false};
+    uint64_t m_sent_frames{0};
+    uint32_t m_last_rtp_ts{0};
+    uint64_t m_rtp_anomaly_count{0};
     int m_port;
 
     // 极简字符串辅助函数 (代替沉重的 JSON 库)

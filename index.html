@@ -21,7 +21,7 @@
         <input type="text" id="ipInput" placeholder="开发板 IP" value="192.168.31.222">
         <button onclick="startWebRTC()">连接监控</button>
     </div>
-    <video id="videoPlayer" autoplay playsinline></video>
+    <video id="videoPlayer" autoplay playsinline muted></video>
     <div id="logs"><b>[系统日志]</b><br></div>
 
     <script>
@@ -29,9 +29,7 @@
         let ws;
         let pendingCandidates = [];
         let statsTimer = null;
-        let statsSeq = 0;
-        let decodeStallWarned = false;
-        const STATS_LOG_EVERY = 15; // 15 * 2s = 30s 输出一次摘要
+        let statsTick = 0;
         const log = (msg, type='') => {
             const l = document.getElementById('logs');
             l.innerHTML += `<span class="${type}">> ${msg}</span><br>`;
@@ -52,7 +50,7 @@
 
         function cleanupPeer() {
             pendingCandidates = [];
-            decodeStallWarned = false;
+            statsTick = 0;
             if (statsTimer) {
                 clearInterval(statsTimer);
                 statsTimer = null;
@@ -91,7 +89,7 @@
         function bindVideoDebug(video) {
             if (video.dataset.debugBound === "1") return;
             video.dataset.debugBound = "1";
-            const events = ["playing", "waiting", "stalled", "pause", "error"];
+            const events = ["playing", "stalled", "error"];
             for (const evt of events) {
                 video.addEventListener(evt, () => {
                     const err = video.error ? ` code=${video.error.code}` : "";
@@ -99,90 +97,122 @@
                 });
             }
         }
+        
+        // 用于保存上一次的统计数据，以计算每秒增量
+        let lastStats = {
+            timestamp: 0,
+            bytesReceived: 0,
+            framesReceived: 0,
+            framesDecoded: 0,
+            framesDropped: 0,
+            freezeCount: 0,
+            pliCount: 0,
+            nackCount: 0,
+            packetsLost: 0
+        };
 
         function startStatsPolling(peer, video) {
             if (statsTimer) {
                 clearInterval(statsTimer);
                 statsTimer = null;
             }
-            statsSeq = 0;
+            
+            log("已开启 WebRTC 统计监控（5秒摘要，异常即时告警）", "log-sys");
+            
             statsTimer = setInterval(async () => {
                 if (!peer || peer.connectionState === "closed") return;
                 try {
                     const stats = await peer.getStats();
                     let inboundVideo = null;
-                    let trackVideo = null;
-                    let codec = null;
-                    let selectedPair = null;
-                    let transport = null;
-                    const candidates = new Map();
 
                     stats.forEach((r) => {
-                        if (r.type === "inbound-rtp" && (r.kind === "video" || r.mediaType === "video")) inboundVideo = r;
-                        if (r.type === "track" && r.kind === "video") trackVideo = r;
-                        if (r.type === "transport") transport = r;
-                        if (r.type === "candidate-pair" && (r.selected || (r.nominated && r.state === "succeeded"))) selectedPair = r;
-                        if (r.type === "local-candidate" || r.type === "remote-candidate") candidates.set(r.id, r);
+                        if (r.type === "inbound-rtp" && (r.kind === "video" || r.mediaType === "video")) {
+                            inboundVideo = r;
+                        }
                     });
 
-                    if (!selectedPair && transport && transport.selectedCandidatePairId) {
-                        const pair = stats.get(transport.selectedCandidatePairId);
-                        if (pair) selectedPair = pair;
-                    }
+                    if (inboundVideo) {
+                        const now = inboundVideo.timestamp;
+                        const bytes = inboundVideo.bytesReceived || 0;
+                        const rxFrames = inboundVideo.framesReceived || 0;
+                        const decFrames = inboundVideo.framesDecoded || 0;
+                        const dropFrames = inboundVideo.framesDropped || 0;
+                        const freezes = inboundVideo.freezeCount || 0;
+                        const pli = inboundVideo.pliCount || 0;
+                        const nack = inboundVideo.nackCount || 0;
+                        const lost = inboundVideo.packetsLost || 0;
+                        const jitter = inboundVideo.jitter || 0;
+                        
+                        // 计算平均 Jitter Buffer 延迟 (单位: 毫秒)
+                        const jbDelay = inboundVideo.jitterBufferDelay || 0;
+                        const jbEmitted = inboundVideo.jitterBufferEmittedCount || 1;
+                        const avgJitterMs = ((jbDelay / jbEmitted) * 1000).toFixed(1);
 
-                    if (inboundVideo && inboundVideo.codecId) {
-                        codec = stats.get(inboundVideo.codecId) || null;
-                    }
+                        // 计算与上一次统计的时间差 (单位: 秒)
+                        const timeDiff = (now - lastStats.timestamp) / 1000;
 
-                    const bytes = inboundVideo ? (inboundVideo.bytesReceived || 0) : 0;
-                    const framesDecoded = inboundVideo ? (inboundVideo.framesDecoded || 0) : 0;
-                    const framesReceived = inboundVideo ? (inboundVideo.framesReceived || 0) : 0;
-                    const packetsReceived = inboundVideo ? (inboundVideo.packetsReceived || 0) : 0;
-                    const packetsLost = inboundVideo ? (inboundVideo.packetsLost || 0) : 0;
-                    const keyFramesDecoded = inboundVideo ? (inboundVideo.keyFramesDecoded || 0) : 0;
-                    const pli = inboundVideo ? (inboundVideo.pliCount || 0) : 0;
-                    const nack = inboundVideo ? (inboundVideo.nackCount || 0) : 0;
-                    const fir = inboundVideo ? (inboundVideo.firCount || 0) : 0;
-                    const decImpl = inboundVideo && inboundVideo.decoderImplementation ? inboundVideo.decoderImplementation : "n/a";
-                    const codecMime = codec && codec.mimeType ? codec.mimeType : "unknown";
-                    const codecFmtp = codec && codec.sdpFmtpLine ? codec.sdpFmtpLine : "";
-                    const rttMs = selectedPair && selectedPair.currentRoundTripTime != null
-                        ? Math.round(selectedPair.currentRoundTripTime * 1000)
-                        : -1;
+                        if (lastStats.timestamp > 0 && timeDiff > 0) {
+                            // 计算每秒实时增量 (Deltas)
+                            const fpsRx = Math.round((rxFrames - lastStats.framesReceived) / timeDiff);
+                            const fpsDec = Math.round((decFrames - lastStats.framesDecoded) / timeDiff);
+                            const fpsDrop = Math.round((dropFrames - lastStats.framesDropped) / timeDiff);
+                            const kbps = Math.round(((bytes - lastStats.bytesReceived) * 8) / 1000 / timeDiff);
+                            const deltaPli = pli - lastStats.pliCount;
+                            const deltaNack = nack - lastStats.nackCount;
+                            const deltaLost = lost - lastStats.packetsLost;
+                            const deltaFreeze = freezes - lastStats.freezeCount;
 
-                    let route = "n/a";
-                    if (selectedPair) {
-                        const local = candidates.get(selectedPair.localCandidateId);
-                        const remote = candidates.get(selectedPair.remoteCandidateId);
-                        const lip = local ? `${local.ip || local.address || "?"}:${local.port || "?"}` : "?";
-                        const rip = remote ? `${remote.ip || remote.address || "?"}:${remote.port || "?"}` : "?";
-                        route = `${lip} -> ${rip}`;
-                    }
+                            let warn = false;
+                            // 构建核心诊断日志
+                            let logMsg = `[统计] 码率:${kbps}kbps | FPS(收/解/丢): ${fpsRx}/${fpsDec}/${fpsDrop} | Jitter:${avgJitterMs}ms`;
+                            let logType = "log-sys";
 
-                    const videoInfo = `ready=${video.readyState} draw=${video.videoWidth}x${video.videoHeight}`;
-                    const trackInfo = trackVideo
-                        ? `track(framesRx=${trackVideo.framesReceived || 0}, framesDec=${trackVideo.framesDecoded || 0}, drop=${trackVideo.framesDropped || 0}, size=${trackVideo.frameWidth || 0}x${trackVideo.frameHeight || 0})`
-                        : "track(n/a)";
+                            // 异常诊断告警规则
+                            if (fpsRx > 0 && fpsDec === 0) {
+                                logMsg += ` | 解码停滞`;
+                                logType = "log-warn";
+                                warn = true;
+                            } else if (fpsDrop > 0) {
+                                logMsg += ` | 丢帧(+${fpsDrop})`;
+                                logType = "log-warn";
+                                warn = true;
+                            }
+                            
+                            if (deltaPli > 0 || deltaNack > 0 || deltaLost > 0) {
+                                logMsg += ` | 网络异常: 丢包(+${deltaLost}) NACK(+${deltaNack}) PLI(+${deltaPli})`;
+                                logType = "log-warn";
+                                warn = true;
+                            }
 
-                    statsSeq++;
-                    if (statsSeq % STATS_LOG_EVERY === 0) {
-                        log(
-                            `[Stats#${statsSeq}] framesDec=${framesDecoded} framesRx=${framesReceived} keyDec=${keyFramesDecoded} pli=${pli} rttMs=${rttMs} codec=${codecMime} ${videoInfo}`,
-                            "log-sys"
-                        );
-                    }
+                            if (deltaFreeze > 0) {
+                                logMsg += ` | 冻结(+${deltaFreeze})`;
+                                logType = "log-warn";
+                                warn = true;
+                            }
 
-                    if (bytes > 0 && framesDecoded === 0 && !decodeStallWarned) {
-                        log("诊断: 已有 bytesReceived 但 framesDecoded=0。优先检查浏览器 HEVC 支持、SDP fmtp、关键帧 VPS/SPS/PPS 是否随 IDR 下发。", "log-warn");
-                        decodeStallWarned = true;
-                    }
-                    if (framesDecoded > 0) {
-                        decodeStallWarned = false;
+                            statsTick++;
+                            if (warn || statsTick % 5 === 0) {
+                                log(logMsg, logType);
+                            }
+                        }
+
+                        // 更新上一次的记录
+                        lastStats = {
+                            timestamp: now,
+                            bytesReceived: bytes,
+                            framesReceived: rxFrames,
+                            framesDecoded: decFrames,
+                            framesDropped: dropFrames,
+                            freezeCount: freezes,
+                            pliCount: pli,
+                            nackCount: nack,
+                            packetsLost: lost
+                        };
                     }
                 } catch (err) {
                     log(`getStats 失败: ${err.message || err}`, "log-warn");
                 }
-            }, 2000);
+            }, 1000); // 1秒轮询一次
         }
 
         function checkH265Support() {
@@ -217,9 +247,7 @@
                     try {
                         log("收到开发板的 Offer，正在握手...", "log-sys");
                         pc = new RTCPeerConnection();
-                        pc.onconnectionstatechange = () => log(`连接状态: ${pc.connectionState}`, "log-sys");
-                        pc.onsignalingstatechange = () => log(`信令状态: ${pc.signalingState}`, "log-sys");
-                        pc.onicegatheringstatechange = () => log(`ICE 采集状态: ${pc.iceGatheringState}`, "log-sys");
+                        pc.onconnectionstatechange = () => log(`连接状态: ${pc.connectionState}`, pc.connectionState === "failed" || pc.connectionState === "disconnected" ? "log-warn" : "log-sys");
 
                         pc.onicecandidate = (e) => {
                             if (e.candidate && e.candidate.sdpMid && isGoodIp(e.candidate.candidate)) {
@@ -227,13 +255,24 @@
                             }
                         };
 
-                        pc.oniceconnectionstatechange = () => log(`网络状态变化: ${pc.iceConnectionState}`, "log-sys");
+                        pc.oniceconnectionstatechange = () => {
+                            const s = pc.iceConnectionState;
+                            if (s === "failed" || s === "disconnected") {
+                                log(`ICE 状态: ${s}`, "log-warn");
+                            }
+                        };
 
                         pc.ontrack = (e) => {
                             log("WebRTC 视频通道已打通，正在播放 H.265 画面。", "log-sys");
+                            
+                            // 【核心修复 2】强制将 Jitter Buffer 延迟降为 0，相当于 GStreamer 的 sync=false
+                            if (e.receiver && 'playoutDelayHint' in e.receiver) {
+                                e.receiver.playoutDelayHint = 0;
+                                log("已设置 playoutDelayHint=0", "log-sys");
+                            }
+
                             const v = document.getElementById('videoPlayer');
                             v.srcObject = e.streams[0];
-                            const t = e.track;
                             v.play().catch((err) => log(`video.play() 失败: ${err.message || err}`, "log-warn"));
                             startStatsPolling(pc, v);
                         };
@@ -245,7 +284,11 @@
                         }
                         pendingCandidates = [];
 
-                        const answer = await pc.createAnswer();
+                        // 【核心修复 3】生成 Answer 时明确拒绝接收音频，斩断浏览器死等音频对齐的念想
+                        const answer = await pc.createAnswer({
+                            offerToReceiveAudio: false, 
+                            offerToReceiveVideo: true
+                        });
                         await pc.setLocalDescription(answer);
                         logSdpSummary("LocalAnswer", answer.sdp);
                         ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp }));
@@ -262,8 +305,6 @@
                             } else {
                                 pendingCandidates.push(candidate);
                             }
-                        } else {
-                            log(`[过滤] 忽略非私网 IPv4 路线: ${msg.candidate}`);
                         }
                     } catch (err) {
                         log(`处理 Candidate 失败: ${err.message || err}`, "log-warn");
