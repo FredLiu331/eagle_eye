@@ -9,7 +9,13 @@
         input, button { padding: 10px; font-size: 16px; border-radius: 5px; }
         input { background: #2d2d2d; color: #fff; border: 1px solid #555; width: 200px; }
         button { background: #0e639c; color: white; border: none; cursor: pointer; }
-        video { width: 100%; max-width: 1280px; background: #000; border-radius: 8px; }
+        video {
+            width: 100%;
+            max-width: 1280px;
+            background: #000;
+            border-radius: 8px;
+            transform: scaleX(-1); /* 水平镜像，修正左右反向观感 */
+        }
         #logs { margin-top: 20px; background: #1e1e1e; padding: 15px; border-radius: 5px; height: 300px; overflow-y: auto; font-family: monospace; color: #0f0; line-height: 1.4; }
         .log-warn { color: #ffcc00; }
         .log-sys { color: #00ccff; }
