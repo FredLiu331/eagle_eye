@@ -1,0 +1,14 @@
+CompileFlags:
+  Add: [
+    "-xc++",
+    "-std=c++17",
+    "--target=aarch64-linux-gnu",
+    "--sysroot=/home/tomato/rockchip/rk356x-linux/buildroot/output/rockchip_rk3568/host/aarch64-buildroot-linux-gnu/sysroot",
+    
+    "-isystem", "/home/tomato/rockchip/rk356x-linux/buildroot/output/rockchip_rk3568/host/aarch64-buildroot-linux-gnu/include/c++/12.3.0",
+    "-isystem", "/home/tomato/rockchip/rk356x-linux/buildroot/output/rockchip_rk3568/host/aarch64-buildroot-linux-gnu/include/c++/12.3.0/aarch64-buildroot-linux-gnu",
+    "-isystem", "/home/tomato/rockchip/rk356x-linux/buildroot/output/rockchip_rk3568/host/lib/gcc/aarch64-buildroot-linux-gnu/12.3.0/include",
+    "-isystem", "/home/tomato/rockchip/rk356x-linux/buildroot/output/rockchip_rk3568/host/aarch64-buildroot-linux-gnu/sysroot/usr/include"
+
+    
+  ]

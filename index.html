@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>EagleEye 终极监控</title>
+    <style>
+        body { background: #121212; color: #fff; font-family: sans-serif; padding: 20px; }
+        .controls { margin-bottom: 20px; }
+        input, button { padding: 10px; font-size: 16px; border-radius: 5px; }
+        input { background: #2d2d2d; color: #fff; border: 1px solid #555; width: 200px; }
+        button { background: #0e639c; color: white; border: none; cursor: pointer; }
+        video { width: 100%; max-width: 1280px; background: #000; border-radius: 8px; }
+        #logs { margin-top: 20px; background: #1e1e1e; padding: 15px; border-radius: 5px; height: 300px; overflow-y: auto; font-family: monospace; color: #0f0; line-height: 1.4; }
+        .log-warn { color: #ffcc00; }
+        .log-sys { color: #00ccff; }
+    </style>
+</head>
+<body>
+    <h2>EagleEye 虚拟 AI 云台</h2>
+    <div class="controls">
+        <input type="text" id="ipInput" placeholder="开发板 IP" value="192.168.31.222">
+        <button onclick="startWebRTC()">连接监控</button>
+    </div>
+    <video id="videoPlayer" autoplay playsinline></video>
+    <div id="logs"><b>[系统日志]</b><br></div>
+
+    <script>
+        let pc;
+        let ws;
+        let pendingCandidates = [];
+        let statsTimer = null;
+        let statsSeq = 0;
+        let decodeStallWarned = false;
+        const STATS_LOG_EVERY = 15; // 15 * 2s = 30s 输出一次摘要
+        const log = (msg, type='') => {
+            const l = document.getElementById('logs');
+            l.innerHTML += `<span class="${type}">> ${msg}</span><br>`;
+            l.scrollTop = l.scrollHeight;
+        };
+
+        // 仅过滤出私网 IPv4 候选，避免 mDNS/IPv6 在开发板侧不可解析导致建链失败
+        function isGoodIp(candidateStr) {
+            const m = candidateStr.match(/(\d{1,3}\.){3}\d{1,3}/);
+            if (!m) return false;
+            const ip = m[0];
+            if (ip.startsWith("10.")) return true;
+            if (ip.startsWith("192.168.")) return true;
+            const parts = ip.split('.').map(Number);
+            if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+            return false;
+        }
+
+        function cleanupPeer() {
+            pendingCandidates = [];
+            decodeStallWarned = false;
+            if (statsTimer) {
+                clearInterval(statsTimer);
+                statsTimer = null;
+            }
+            if (pc) {
+                pc.close();
+                pc = null;
+            }
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+        }
+
+        function logSdpSummary(tag, sdp) {
+            if (!sdp) {
+                log(`${tag} SDP 为空`, "log-warn");
+                return;
+            }
+            const lines = sdp.split(/\r\n|\n/).filter(Boolean);
+            const mVideo = lines.find(l => l.startsWith("m=video")) || "m=video <missing>";
+            const rtpmap = lines.filter(l => l.startsWith("a=rtpmap:"));
+            const fmtp = lines.filter(l => l.startsWith("a=fmtp:"));
+            const h26x = rtpmap.filter(l => /H265|HEVC|H264/i.test(l));
+            log(`[${tag}] ${mVideo}`, "log-sys");
+            if (h26x.length > 0) {
+                log(`[${tag}] rtpmap: ${h26x.join(" | ")}`, "log-sys");
+            } else {
+                log(`[${tag}] 未发现 H26x rtpmap，当前 rtpmap 数量=${rtpmap.length}`, "log-warn");
+            }
+            if (fmtp.length > 0) {
+                log(`[${tag}] fmtp: ${fmtp.join(" | ")}`, "log-sys");
+            }
+        }
+
+        function bindVideoDebug(video) {
+            if (video.dataset.debugBound === "1") return;
+            video.dataset.debugBound = "1";
+            const events = ["playing", "waiting", "stalled", "pause", "error"];
+            for (const evt of events) {
+                video.addEventListener(evt, () => {
+                    const err = video.error ? ` code=${video.error.code}` : "";
+                    log(`[video:${evt}] readyState=${video.readyState} size=${video.videoWidth}x${video.videoHeight}${err}`, evt === "error" || evt === "stalled" ? "log-warn" : "log-sys");
+                });
+            }
+        }
+
+        function startStatsPolling(peer, video) {
+            if (statsTimer) {
+                clearInterval(statsTimer);
+                statsTimer = null;
+            }
+            statsSeq = 0;
+            statsTimer = setInterval(async () => {
+                if (!peer || peer.connectionState === "closed") return;
+                try {
+                    const stats = await peer.getStats();
+                    let inboundVideo = null;
+                    let trackVideo = null;
+                    let codec = null;
+                    let selectedPair = null;
+                    let transport = null;
+                    const candidates = new Map();
+
+                    stats.forEach((r) => {
+                        if (r.type === "inbound-rtp" && (r.kind === "video" || r.mediaType === "video")) inboundVideo = r;
+                        if (r.type === "track" && r.kind === "video") trackVideo = r;
+                        if (r.type === "transport") transport = r;
+                        if (r.type === "candidate-pair" && (r.selected || (r.nominated && r.state === "succeeded"))) selectedPair = r;
+                        if (r.type === "local-candidate" || r.type === "remote-candidate") candidates.set(r.id, r);
+                    });
+
+                    if (!selectedPair && transport && transport.selectedCandidatePairId) {
+                        const pair = stats.get(transport.selectedCandidatePairId);
+                        if (pair) selectedPair = pair;
+                    }
+
+                    if (inboundVideo && inboundVideo.codecId) {
+                        codec = stats.get(inboundVideo.codecId) || null;
+                    }
+
+                    const bytes = inboundVideo ? (inboundVideo.bytesReceived || 0) : 0;
+                    const framesDecoded = inboundVideo ? (inboundVideo.framesDecoded || 0) : 0;
+                    const framesReceived = inboundVideo ? (inboundVideo.framesReceived || 0) : 0;
+                    const packetsReceived = inboundVideo ? (inboundVideo.packetsReceived || 0) : 0;
+                    const packetsLost = inboundVideo ? (inboundVideo.packetsLost || 0) : 0;
+                    const keyFramesDecoded = inboundVideo ? (inboundVideo.keyFramesDecoded || 0) : 0;
+                    const pli = inboundVideo ? (inboundVideo.pliCount || 0) : 0;
+                    const nack = inboundVideo ? (inboundVideo.nackCount || 0) : 0;
+                    const fir = inboundVideo ? (inboundVideo.firCount || 0) : 0;
+                    const decImpl = inboundVideo && inboundVideo.decoderImplementation ? inboundVideo.decoderImplementation : "n/a";
+                    const codecMime = codec && codec.mimeType ? codec.mimeType : "unknown";
+                    const codecFmtp = codec && codec.sdpFmtpLine ? codec.sdpFmtpLine : "";
+                    const rttMs = selectedPair && selectedPair.currentRoundTripTime != null
+                        ? Math.round(selectedPair.currentRoundTripTime * 1000)
+                        : -1;
+
+                    let route = "n/a";
+                    if (selectedPair) {
+                        const local = candidates.get(selectedPair.localCandidateId);
+                        const remote = candidates.get(selectedPair.remoteCandidateId);
+                        const lip = local ? `${local.ip || local.address || "?"}:${local.port || "?"}` : "?";
+                        const rip = remote ? `${remote.ip || remote.address || "?"}:${remote.port || "?"}` : "?";
+                        route = `${lip} -> ${rip}`;
+                    }
+
+                    const videoInfo = `ready=${video.readyState} draw=${video.videoWidth}x${video.videoHeight}`;
+                    const trackInfo = trackVideo
+                        ? `track(framesRx=${trackVideo.framesReceived || 0}, framesDec=${trackVideo.framesDecoded || 0}, drop=${trackVideo.framesDropped || 0}, size=${trackVideo.frameWidth || 0}x${trackVideo.frameHeight || 0})`
+                        : "track(n/a)";
+
+                    statsSeq++;
+                    if (statsSeq % STATS_LOG_EVERY === 0) {
+                        log(
+                            `[Stats#${statsSeq}] framesDec=${framesDecoded} framesRx=${framesReceived} keyDec=${keyFramesDecoded} pli=${pli} rttMs=${rttMs} codec=${codecMime} ${videoInfo}`,
+                            "log-sys"
+                        );
+                    }
+
+                    if (bytes > 0 && framesDecoded === 0 && !decodeStallWarned) {
+                        log("诊断: 已有 bytesReceived 但 framesDecoded=0。优先检查浏览器 HEVC 支持、SDP fmtp、关键帧 VPS/SPS/PPS 是否随 IDR 下发。", "log-warn");
+                        decodeStallWarned = true;
+                    }
+                    if (framesDecoded > 0) {
+                        decodeStallWarned = false;
+                    }
+                } catch (err) {
+                    log(`getStats 失败: ${err.message || err}`, "log-warn");
+                }
+            }, 2000);
+        }
+
+        function checkH265Support() {
+            const caps = RTCRtpReceiver.getCapabilities && RTCRtpReceiver.getCapabilities('video');
+            if (!caps || !caps.codecs) return;
+            const hasH265 = caps.codecs.some(c => {
+                const mt = (c.mimeType || '').toLowerCase();
+                return mt === 'video/h265' || mt === 'video/hevc';
+            });
+            if (!hasH265) {
+                log("当前浏览器可能不支持 WebRTC H.265，握手可能失败。建议用支持 HEVC 的浏览器/版本。", "log-warn");
+            }
+        }
+
+        async function startWebRTC() {
+            cleanupPeer();
+            checkH265Support();
+            bindVideoDebug(document.getElementById('videoPlayer'));
+
+            const ip = document.getElementById('ipInput').value;
+            log(`正在连接 WebSocket: ws://${ip}:8080 ...`, "log-sys");
+            ws = new WebSocket(`ws://${ip}:8080`);
+
+            ws.onopen = () => log("WebSocket 连接成功，等待开发板发送 H.265 Offer...");
+            ws.onerror = (e) => log(`WebSocket 错误: ${e.type || 'unknown'}`, "log-warn");
+            ws.onclose = () => log("WebSocket 已关闭。", "log-warn");
+            
+            ws.onmessage = async (event) => {
+                const msg = JSON.parse(event.data);
+
+                if (msg.type === 'offer') {
+                    try {
+                        log("收到开发板的 Offer，正在握手...", "log-sys");
+                        pc = new RTCPeerConnection();
+                        pc.onconnectionstatechange = () => log(`连接状态: ${pc.connectionState}`, "log-sys");
+                        pc.onsignalingstatechange = () => log(`信令状态: ${pc.signalingState}`, "log-sys");
+                        pc.onicegatheringstatechange = () => log(`ICE 采集状态: ${pc.iceGatheringState}`, "log-sys");
+
+                        pc.onicecandidate = (e) => {
+                            if (e.candidate && e.candidate.sdpMid && isGoodIp(e.candidate.candidate)) {
+                                ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate.candidate, mid: e.candidate.sdpMid }));
+                            }
+                        };
+
+                        pc.oniceconnectionstatechange = () => log(`网络状态变化: ${pc.iceConnectionState}`, "log-sys");
+
+                        pc.ontrack = (e) => {
+                            log("WebRTC 视频通道已打通，正在播放 H.265 画面。", "log-sys");
+                            const v = document.getElementById('videoPlayer');
+                            v.srcObject = e.streams[0];
+                            const t = e.track;
+                            v.play().catch((err) => log(`video.play() 失败: ${err.message || err}`, "log-warn"));
+                            startStatsPolling(pc, v);
+                        };
+
+                        await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+                        logSdpSummary("RemoteOffer", msg.sdp);
+                        for (const c of pendingCandidates) {
+                            await pc.addIceCandidate(c);
+                        }
+                        pendingCandidates = [];
+
+                        const answer = await pc.createAnswer();
+                        await pc.setLocalDescription(answer);
+                        logSdpSummary("LocalAnswer", answer.sdp);
+                        ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp }));
+                    } catch (err) {
+                        log(`处理 Offer 失败: ${err.message || err}`, "log-warn");
+                    }
+                } 
+                else if (msg.type === 'candidate') {
+                    try {
+                        if (isGoodIp(msg.candidate)) {
+                            const candidate = new RTCIceCandidate({ candidate: msg.candidate, sdpMid: msg.mid });
+                            if (pc && pc.remoteDescription) {
+                                await pc.addIceCandidate(candidate);
+                            } else {
+                                pendingCandidates.push(candidate);
+                            }
+                        } else {
+                            log(`[过滤] 忽略非私网 IPv4 路线: ${msg.candidate}`);
+                        }
+                    } catch (err) {
+                        log(`处理 Candidate 失败: ${err.message || err}`, "log-warn");
+                    }
+                }
+            };
+        }
+    </script>
+</body>
+</html>
