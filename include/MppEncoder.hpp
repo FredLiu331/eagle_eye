@@ -86,13 +86,19 @@ public:
             std::cerr << "[WARNING] EagleEye: Failed to set MPP header mode EACH_IDR." << std::endl;
         }
 
+        std::vector<uint8_t> hdr_buf(16 * 1024);
         MppPacket hdr_pkt = nullptr;
-        if (m_mpi->control(m_ctx, MPP_ENC_GET_EXTRA_INFO, &hdr_pkt) == MPP_OK && hdr_pkt) {
-            void *ptr = mpp_packet_get_pos(hdr_pkt);
-            size_t len = mpp_packet_get_length(hdr_pkt);
-            m_header.assign((uint8_t *)ptr, (uint8_t *)ptr + len);
+        if (mpp_packet_init(&hdr_pkt, hdr_buf.data(), hdr_buf.size()) == MPP_OK) {
+            mpp_packet_set_length(hdr_pkt, 0);
+            if (m_mpi->control(m_ctx, MPP_ENC_GET_HDR_SYNC, hdr_pkt) == MPP_OK) {
+                void *ptr = mpp_packet_get_pos(hdr_pkt);
+                size_t len = mpp_packet_get_length(hdr_pkt);
+                if (ptr && len > 0) {
+                    m_header.assign((uint8_t *)ptr, (uint8_t *)ptr + len);
+                    std::cout << "[INFO] EagleEye: Extracted H.265 Header (" << len << " bytes)." << std::endl;
+                }
+            }
             mpp_packet_deinit(&hdr_pkt);
-            std::cout << "[INFO] EagleEye: Extracted H.265 Header (" << len << " bytes)." << std::endl;
         }
         std::cout << "[INFO] EagleEye: MPP H.265 Encoder Initialized (" << width << "x" << height << ", "
                   << bps / 1000 << "kbps)." << std::endl;
@@ -100,7 +106,7 @@ public:
     }
 
     // 执行编码，直接传入 DMA-BUF FD，返回 H.265 NALU 字节流
-    std::vector<uint8_t> encode(int dma_fd, uint32_t size) {
+    std::vector<uint8_t> encode(int dma_fd, uint32_t size, uint64_t pts) {
         std::vector<uint8_t> encoded_data;
 
         MppFrame frame = nullptr;
@@ -117,12 +123,17 @@ public:
         info.type = MPP_BUFFER_TYPE_EXT_DMA;
         info.fd = dma_fd;
         info.size = size;
-        info.index = dma_fd;
+        info.index = -1;
 
         MppBuffer buffer = nullptr;
-        mpp_buffer_import(&buffer, &info);
+        if (mpp_buffer_import(&buffer, &info) != MPP_OK || !buffer) {
+            std::cerr << "[ERROR] EagleEye: mpp_buffer_import failed for fd=" << dma_fd << std::endl;
+            mpp_frame_deinit(&frame);
+            return encoded_data;
+        }
         mpp_frame_set_buffer(frame, buffer);
         mpp_frame_set_eos(frame, 0);
+        mpp_frame_set_pts(frame, pts);
 
         // 1. 送入一帧给硬件编码器
         if (m_mpi->encode_put_frame(m_ctx, frame) != MPP_OK) {
@@ -130,6 +141,7 @@ public:
         }
 
         // 2. 获取编码后的数据包（兼容 split/partition 输出，直到一帧结束）
+        bool header_injected = false;
         while (true) {
             MppPacket packet = nullptr;
             if (m_mpi->encode_get_packet(m_ctx, &packet) != MPP_OK || !packet) {
@@ -158,8 +170,9 @@ public:
             }
 
             // 兜底：如果该帧是关键帧且当前 chunk 内没带 VPS/SPS/PPS，则手工补头
-            if (is_intra && !m_header.empty() && !hasHevcParamSets(chunk)) {
+            if (is_intra && !m_header.empty() && !hasHevcParamSets(chunk) && !header_injected) {
                 encoded_data.insert(encoded_data.end(), m_header.begin(), m_header.end());
+                header_injected = true;
             }
             encoded_data.insert(encoded_data.end(), chunk.begin(), chunk.end());
 

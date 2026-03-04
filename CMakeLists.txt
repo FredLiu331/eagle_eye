@@ -7,9 +7,16 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS_FILE "${CMAKE_SOURCE_DIR}/compile_commands.json")
-# 2. 极致的交叉编译性能优化
-# RK3568 是四核 Cortex-A55，开启 -O3 和特定架构指令集以压榨 CPU 性能
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -O3 -mcpu=cortex-a55")
+
+# 2. 单一开关：一键切换调试/发布构建
+# 用法：-DEAGLE_EYE_DEBUG=ON (Debug) / OFF (Release)
+option(EAGLE_EYE_DEBUG "Build eagle_eye with debug flags" ON)
+
+if(EAGLE_EYE_DEBUG)
+    set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
+else()
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
 
 # 3. 使用 PkgConfig 查找系统依赖 (这是嵌入式 Linux 最稳妥的方案)
 find_package(PkgConfig REQUIRED)
@@ -22,6 +29,19 @@ file(GLOB_RECURSE SOURCES "src/*.cpp")
 
 # 5. 声明目标文件
 add_executable(${PROJECT_NAME} ${SOURCES})
+
+# 统一编译选项（由 EAGLE_EYE_DEBUG 单开关控制）
+target_compile_options(${PROJECT_NAME} PRIVATE
+    -Wall
+    -Wextra
+    -mcpu=cortex-a55
+)
+
+if(EAGLE_EYE_DEBUG)
+    target_compile_options(${PROJECT_NAME} PRIVATE -O0 -g3)
+else()
+    target_compile_options(${PROJECT_NAME} PRIVATE -O3 -DNDEBUG)
+endif()
 
 # 6. 头文件搜索路径
 target_include_directories(${PROJECT_NAME} PRIVATE

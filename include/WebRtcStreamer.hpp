@@ -133,7 +133,6 @@ public:
         }
 
         if (track && track->isOpen() && !nalu.empty()) {
-            // 使用稳定路径，避免不同版本库在 sendFrame/FrameInfo 上的兼容问题
             track->send(reinterpret_cast<const std::byte*>(nalu.data()), nalu.size());
         }
     }

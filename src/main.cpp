@@ -75,6 +75,7 @@ int main() {
 
   // [修改] 主循环抓取多帧
   int drop_frames_count = DROP_FRAMES;
+  uint64_t frame_count = 0;
   while (true) {
     struct v4l2_buffer dqbuf = {};
     struct v4l2_plane dqplanes[1] = {};
@@ -102,8 +103,9 @@ int main() {
       // 正常处理流程
       int crop_x = (SRC_WIDTH - DST_WIDTH) / 2;
       int crop_y = (SRC_HEIGHT - DST_HEIGHT) / 2;
-      int rga_out_fd = rgaPool.getBuffer(0).fd;
-      uint32_t rga_out_size = rgaPool.getBuffer(0).size;
+      int current_rga_idx = frame_count % 2;
+      int rga_out_fd = rgaPool.getBuffer(current_rga_idx).fd;
+      uint32_t rga_out_size = rgaPool.getBuffer(current_rga_idx).size;
 
       // [步骤 A] RGA 硬件剪裁 1080P
       bool rga_ok =
@@ -115,14 +117,16 @@ int main() {
           (void)encoder.forceIdr();
         }
 
-        // [步骤 B] MPP 硬件编码为 H.265
+        // [步骤 B] 构造平滑 PTS 并进行 MPP H.265 编码
+        uint64_t perfect_pts = frame_count * 33333ULL;
         std::vector<uint8_t> h265_nalu =
-            encoder.encode(rga_out_fd, rga_out_size);
+            encoder.encode(rga_out_fd, rga_out_size, perfect_pts);
 
         if (!h265_nalu.empty()) {
           // [步骤 C] 将 H.265 码流推送到 WebRTC 网络！
           streamer.pushFrame(h265_nalu);
         }
+        frame_count++;
       }
     }
 
