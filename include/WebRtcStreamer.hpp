@@ -147,13 +147,25 @@ public:
 
         if (m_sent_frames > 0) {
             const uint32_t rtp_step = rtp_ts - m_last_rtp_ts;
-            // 30fps 对应步长约 3000
-            if (rtp_step < 1500 || rtp_step > 4500) {
-                m_rtp_anomaly_count++;
-                if ((m_rtp_anomaly_count % 20) == 1) {
-                    std::cout << "[WARN] EagleEye: RTP timestamp step abnormal: "
-                              << rtp_step << " ticks (count=" << m_rtp_anomaly_count
-                              << ")" << std::endl;
+            if (m_rtp_step_ema <= 0.0) {
+                m_rtp_step_ema = static_cast<double>(rtp_step);
+            } else {
+                m_rtp_step_ema = m_rtp_step_ema * 0.9 + static_cast<double>(rtp_step) * 0.1;
+            }
+            m_rtp_step_samples++;
+
+            if (m_rtp_step_samples > 30) {
+                const double low = m_rtp_step_ema * 0.5;
+                const double high = m_rtp_step_ema * 1.5;
+                if (static_cast<double>(rtp_step) < low || static_cast<double>(rtp_step) > high) {
+                    m_rtp_anomaly_count++;
+                    if ((m_rtp_anomaly_count % 20) == 1) {
+                        std::cout << "[WARN] EagleEye: RTP timestamp step abnormal: "
+                                  << rtp_step << " ticks (ema="
+                                  << static_cast<uint32_t>(m_rtp_step_ema)
+                                  << ", count=" << m_rtp_anomaly_count
+                                  << ")" << std::endl;
+                    }
                 }
             }
         }
@@ -176,6 +188,8 @@ private:
     uint64_t m_sent_frames{0};
     uint32_t m_last_rtp_ts{0};
     uint64_t m_rtp_anomaly_count{0};
+    double m_rtp_step_ema{0.0};
+    uint64_t m_rtp_step_samples{0};
     int m_port;
 
     // 极简字符串辅助函数 (代替沉重的 JSON 库)

@@ -24,6 +24,30 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(DRM REQUIRED libdrm)
 pkg_check_modules(MPP rockchip_mpp)
 pkg_check_modules(DATACHANNEL libdatachannel)
+
+set(RKNN_RUNTIME_ROOT
+    "${CMAKE_SOURCE_DIR}/../rknpu2/runtime/RK356X/Linux/librknn_api"
+    CACHE PATH "Path to RKNN runtime root")
+
+find_path(RKNN_INCLUDE_DIR
+    NAMES rknn_api.h
+    HINTS
+        ${STAGING_DIR}/usr/include/rknn
+        ${CMAKE_SYSROOT}/usr/include/rknn
+        ${RKNN_RUNTIME_ROOT}/include
+)
+
+find_library(RKNN_LIBRARY
+    NAMES rknnrt rknn_api
+    HINTS
+        ${STAGING_DIR}/usr/lib
+        ${CMAKE_SYSROOT}/usr/lib
+        ${RKNN_RUNTIME_ROOT}/aarch64
+)
+
+if(NOT RKNN_INCLUDE_DIR OR NOT RKNN_LIBRARY)
+    message(FATAL_ERROR "RKNN runtime not found. Check RKNN_INCLUDE_DIR/RKNN_LIBRARY.")
+endif()
 # 4. 收集源码
 file(GLOB_RECURSE SOURCES "src/*.cpp")
 
@@ -38,7 +62,7 @@ target_compile_options(${PROJECT_NAME} PRIVATE
 )
 
 if(EAGLE_EYE_DEBUG)
-    target_compile_options(${PROJECT_NAME} PRIVATE -O0 -g3)
+    target_compile_options(${PROJECT_NAME} PRIVATE -Og -g3)
 else()
     target_compile_options(${PROJECT_NAME} PRIVATE -O3 -DNDEBUG)
 endif()
@@ -53,14 +77,14 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_SYSROOT}/usr/include/rga
     ${MPP_INCLUDE_DIRS}
     ${DATACHANNEL_INCLUDE_DIRS}
+    ${RKNN_INCLUDE_DIR}
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
     ${DRM_LIBRARIES}        # [基础] Linux DRM (必须，用于 DMA-BUF 申请)
     rga                     # [核心] 瑞芯微 2D 图形加速引擎 (硬件缩放与裁剪)
     rockchip_mpp
-    # --- 下面是预留的链路库，做到哪一步解开哪一步 ---
-    # rknn_api              # [第二阶段] 瑞芯微 NPU 推理 API
+    ${RKNN_LIBRARY}         # [第二阶段] 瑞芯微 NPU 推理 API
     datachannel           # [第四阶段] WebRTC 协议栈 (推荐 libdatachannel)
     # mbedtls               # WebRTC 依赖的加密库
     # srtp2                 # WebRTC 依赖的媒体流加密库
