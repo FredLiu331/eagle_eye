@@ -35,7 +35,23 @@
         let ws;
         let pendingCandidates = [];
         let statsTimer = null;
+        let wsPingTimer = null;
         let statsTick = 0;
+        let clockSyncTick = 0;
+        let hasClockOffset = false;
+        let clockOffsetMs = 0;
+        let latestSenderPipelineMs = 0;
+        const frameTimingMap = new Map();
+        const FRAME_TIMING_TTL_MS = 6000;
+        const MAX_FRAME_TIMING_CACHE = 600;
+        const e2eStats = {
+            count: 0,
+            sumMs: 0,
+            minMs: Number.POSITIVE_INFINITY,
+            maxMs: 0,
+            emaMs: 0,
+            senderPipelineSumMs: 0
+        };
         const log = (msg, type='') => {
             const l = document.getElementById('logs');
             l.innerHTML += `<span class="${type}">> ${msg}</span><br>`;
@@ -57,9 +73,33 @@
         function cleanupPeer() {
             pendingCandidates = [];
             statsTick = 0;
+            clockSyncTick = 0;
+            hasClockOffset = false;
+            clockOffsetMs = 0;
+            latestSenderPipelineMs = 0;
+            frameTimingMap.clear();
+            e2eStats.count = 0;
+            e2eStats.sumMs = 0;
+            e2eStats.minMs = Number.POSITIVE_INFINITY;
+            e2eStats.maxMs = 0;
+            e2eStats.emaMs = 0;
+            e2eStats.senderPipelineSumMs = 0;
+            lastStats.timestamp = 0;
+            lastStats.bytesReceived = 0;
+            lastStats.framesReceived = 0;
+            lastStats.framesDecoded = 0;
+            lastStats.framesDropped = 0;
+            lastStats.freezeCount = 0;
+            lastStats.pliCount = 0;
+            lastStats.nackCount = 0;
+            lastStats.packetsLost = 0;
             if (statsTimer) {
                 clearInterval(statsTimer);
                 statsTimer = null;
+            }
+            if (wsPingTimer) {
+                clearInterval(wsPingTimer);
+                wsPingTimer = null;
             }
             if (pc) {
                 pc.close();
@@ -102,6 +142,134 @@
                     log(`[video:${evt}] readyState=${video.readyState} size=${video.videoWidth}x${video.videoHeight}${err}`, evt === "error" || evt === "stalled" ? "log-warn" : "log-sys");
                 });
             }
+        }
+
+        function pruneFrameTimingCache() {
+            const nowMs = Date.now();
+            for (const [key, value] of frameTimingMap) {
+                if ((nowMs - value.recvMs) > FRAME_TIMING_TTL_MS) {
+                    frameTimingMap.delete(key);
+                }
+            }
+            while (frameTimingMap.size > MAX_FRAME_TIMING_CACHE) {
+                const oldestKey = frameTimingMap.keys().next().value;
+                frameTimingMap.delete(oldestKey);
+            }
+        }
+
+        function handleFrameTimingMessage(msg) {
+            const rtpTsRaw = Number(msg.rtp_ts);
+            const captureRealtimeUs = Number(msg.capture_realtime_us);
+            const senderPipelineUs = Number(msg.sender_pipeline_us);
+            if (!Number.isFinite(rtpTsRaw) || !Number.isFinite(captureRealtimeUs)) {
+                return;
+            }
+            const rtpTs = (rtpTsRaw >>> 0);
+            const senderPipelineMs = Number.isFinite(senderPipelineUs) ? (senderPipelineUs / 1000.0) : 0;
+            if (senderPipelineMs > 0) {
+                latestSenderPipelineMs = senderPipelineMs;
+            }
+            frameTimingMap.set(rtpTs, {
+                captureRealtimeUs: captureRealtimeUs,
+                senderPipelineMs: senderPipelineMs,
+                recvMs: Date.now()
+            });
+            pruneFrameTimingCache();
+        }
+
+        function handleLatencyPongMessage(msg) {
+            const clientSendMs = Number(msg.client_send_ms);
+            const serverRecvUs = Number(msg.server_recv_us);
+            const serverSendUs = Number(msg.server_send_us);
+            if (!Number.isFinite(clientSendMs) || !Number.isFinite(serverRecvUs) || !Number.isFinite(serverSendUs)) {
+                return;
+            }
+            const clientRecvMs = Date.now();
+            const rttMs = Math.max(0, clientRecvMs - clientSendMs);
+            const serverMidMs = (serverRecvUs + serverSendUs) / 2000.0;
+            const estimatedOffsetMs = serverMidMs - (clientSendMs + rttMs * 0.5);
+            if (!hasClockOffset) {
+                clockOffsetMs = estimatedOffsetMs;
+                hasClockOffset = true;
+            } else {
+                clockOffsetMs = clockOffsetMs * 0.9 + estimatedOffsetMs * 0.1;
+            }
+            clockSyncTick++;
+            if (clockSyncTick % 10 === 1) {
+                log(`[E2E] 时钟同步 RTT=${rttMs.toFixed(1)}ms offset=${clockOffsetMs.toFixed(1)}ms`, "log-sys");
+            }
+        }
+
+        function sendLatencyPing() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            ws.send(JSON.stringify({
+                type: "latency_ping",
+                client_send_ms: String(Date.now())
+            }));
+        }
+
+        function startClockSync() {
+            if (wsPingTimer) {
+                clearInterval(wsPingTimer);
+                wsPingTimer = null;
+            }
+            sendLatencyPing();
+            wsPingTimer = setInterval(sendLatencyPing, 2000);
+        }
+
+        function updateE2EStats(e2eMs, senderPipelineMs) {
+            if (!Number.isFinite(e2eMs) || e2eMs < 0 || e2eMs > 5000) {
+                return;
+            }
+            e2eStats.count++;
+            e2eStats.sumMs += e2eMs;
+            e2eStats.minMs = Math.min(e2eStats.minMs, e2eMs);
+            e2eStats.maxMs = Math.max(e2eStats.maxMs, e2eMs);
+            e2eStats.senderPipelineSumMs += Math.max(0, senderPipelineMs);
+            if (e2eStats.emaMs <= 0) {
+                e2eStats.emaMs = e2eMs;
+            } else {
+                e2eStats.emaMs = e2eStats.emaMs * 0.9 + e2eMs * 0.1;
+            }
+
+            if (e2eStats.count % 30 === 0) {
+                const avgMs = e2eStats.sumMs / e2eStats.count;
+                const senderAvgMs = e2eStats.senderPipelineSumMs / e2eStats.count;
+                const receiverApproxMs = Math.max(0, avgMs - senderAvgMs);
+                log(
+                    `[E2E] avg=${avgMs.toFixed(1)}ms ema=${e2eStats.emaMs.toFixed(1)}ms min/max=${e2eStats.minMs.toFixed(1)}/${e2eStats.maxMs.toFixed(1)}ms | sender=${senderAvgMs.toFixed(1)}ms receiver≈${receiverApproxMs.toFixed(1)}ms`,
+                    "log-sys"
+                );
+            }
+        }
+
+        function startRenderLatencyProbe(video) {
+            if (video.dataset.latencyProbeBound === "1") return;
+            if (typeof video.requestVideoFrameCallback !== "function") {
+                log("浏览器不支持 requestVideoFrameCallback，无法逐帧测量端到端时延。", "log-warn");
+                return;
+            }
+            video.dataset.latencyProbeBound = "1";
+            const onVideoFrame = (_now, metadata) => {
+                const rawRtp = metadata && Number.isFinite(metadata.rtpTimestamp)
+                    ? Number(metadata.rtpTimestamp)
+                    : null;
+                if (rawRtp !== null && hasClockOffset) {
+                    const rtpTs = (rawRtp >>> 0);
+                    const frameMeta = frameTimingMap.get(rtpTs);
+                    if (frameMeta) {
+                        frameTimingMap.delete(rtpTs);
+                        const captureServerMs = frameMeta.captureRealtimeUs / 1000.0;
+                        const captureClientMs = captureServerMs - clockOffsetMs;
+                        const renderClientMs = Date.now();
+                        const e2eMs = renderClientMs - captureClientMs;
+                        updateE2EStats(e2eMs, frameMeta.senderPipelineMs);
+                    }
+                }
+                video.requestVideoFrameCallback(onVideoFrame);
+            };
+            video.requestVideoFrameCallback(onVideoFrame);
+            log("已启用逐帧端到端时延测量（requestVideoFrameCallback + RTP 时间戳匹配）", "log-sys");
         }
         
         // 用于保存上一次的统计数据，以计算每秒增量
@@ -148,11 +316,16 @@
                         const nack = inboundVideo.nackCount || 0;
                         const lost = inboundVideo.packetsLost || 0;
                         const jitter = inboundVideo.jitter || 0;
+                        const networkJitterMs = jitter * 1000.0;
                         
                         // 计算平均 Jitter Buffer 延迟 (单位: 毫秒)
                         const jbDelay = inboundVideo.jitterBufferDelay || 0;
                         const jbEmitted = inboundVideo.jitterBufferEmittedCount || 1;
-                        const avgJitterMs = ((jbDelay / jbEmitted) * 1000).toFixed(1);
+                        const avgJitterBufferMs = (jbDelay / jbEmitted) * 1000.0;
+                        const decodeAvgMs = (decFrames > 0 && inboundVideo.totalDecodeTime)
+                            ? (inboundVideo.totalDecodeTime / decFrames) * 1000.0
+                            : 0;
+                        const estimatedE2EMs = latestSenderPipelineMs + avgJitterBufferMs + decodeAvgMs + 8.0;
 
                         // 计算与上一次统计的时间差 (单位: 秒)
                         const timeDiff = (now - lastStats.timestamp) / 1000;
@@ -170,7 +343,10 @@
 
                             let warn = false;
                             // 构建核心诊断日志
-                            let logMsg = `[统计] 码率:${kbps}kbps | FPS(收/解/丢): ${fpsRx}/${fpsDec}/${fpsDrop} | Jitter:${avgJitterMs}ms`;
+                            let logMsg =
+                                `[统计] 码率:${kbps}kbps | FPS(收/解/丢): ${fpsRx}/${fpsDec}/${fpsDrop}` +
+                                ` | Jitter:${networkJitterMs.toFixed(1)}ms JB:${avgJitterBufferMs.toFixed(1)}ms` +
+                                ` | E2E估算:${estimatedE2EMs.toFixed(1)}ms`;
                             let logType = "log-sys";
 
                             // 异常诊断告警规则
@@ -242,12 +418,36 @@
             log(`正在连接 WebSocket: ws://${ip}:8080 ...`, "log-sys");
             ws = new WebSocket(`ws://${ip}:8080`);
 
-            ws.onopen = () => log("WebSocket 连接成功，等待开发板发送 H.265 Offer...");
+            ws.onopen = () => {
+                log("WebSocket 连接成功，等待开发板发送 H.265 Offer...", "log-sys");
+                startClockSync();
+            };
             ws.onerror = (e) => log(`WebSocket 错误: ${e.type || 'unknown'}`, "log-warn");
-            ws.onclose = () => log("WebSocket 已关闭。", "log-warn");
+            ws.onclose = () => {
+                if (wsPingTimer) {
+                    clearInterval(wsPingTimer);
+                    wsPingTimer = null;
+                }
+                log("WebSocket 已关闭。", "log-warn");
+            };
             
             ws.onmessage = async (event) => {
-                const msg = JSON.parse(event.data);
+                let msg;
+                try {
+                    msg = JSON.parse(event.data);
+                } catch (err) {
+                    log(`解析信令消息失败: ${err.message || err}`, "log-warn");
+                    return;
+                }
+
+                if (msg.type === "frame_timing") {
+                    handleFrameTimingMessage(msg);
+                    return;
+                }
+                if (msg.type === "latency_pong") {
+                    handleLatencyPongMessage(msg);
+                    return;
+                }
 
                 if (msg.type === 'offer') {
                     try {
@@ -279,6 +479,7 @@
 
                             const v = document.getElementById('videoPlayer');
                             v.srcObject = e.streams[0];
+                            startRenderLatencyProbe(v);
                             v.play().catch((err) => log(`video.play() 失败: ${err.message || err}`, "log-warn"));
                             startStatsPolling(pc, v);
                         };

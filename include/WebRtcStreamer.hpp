@@ -7,6 +7,7 @@
 #include <mutex>
 #include <atomic>
 #include <cstdint>
+#include <chrono>
 #include <rtc/rtc.hpp>
 #include <rtc/websocketserver.hpp>
 #include <rtc/h265rtppacketizer.hpp>
@@ -36,6 +37,10 @@ public:
             // 当有浏览器通过 WebSocket 连接过来时
             m_ws_server->onClient([this](std::shared_ptr<rtc::WebSocket> ws) {
                 std::cout << "[INFO] EagleEye: Browser connected! Initiating H.265 Offer..." << std::endl;
+                {
+                    std::lock_guard<std::mutex> lock(m_ws_mutex);
+                    m_signal_ws = ws;
+                }
 
                 rtc::Configuration rtc_config;
                 // rtc_config.iceServers.emplace_back("stun:stun.l.google.com:19302");
@@ -79,7 +84,7 @@ public:
                 });
 
                 // 收到浏览器的 Answer / Candidate
-                ws->onMessage([pc](std::variant<rtc::binary, rtc::string> data) {
+                ws->onMessage([this, pc](std::variant<rtc::binary, rtc::string> data) {
                     if (std::holds_alternative<rtc::string>(data)) {
                         std::string msg = std::get<rtc::string>(data);
                         std::string type = extractValue(msg, "type");
@@ -94,6 +99,18 @@ public:
                             if (!candidate_str.empty() && !mid.empty()) {
                                 pc->addRemoteCandidate(rtc::Candidate(candidate_str, mid));
                             }
+                        } else if (type == "latency_ping") {
+                            const std::string client_send_ms =
+                                extractValue(msg, "client_send_ms");
+                            const uint64_t server_recv_us = nowRealtimeUs();
+                            const uint64_t server_send_us = nowRealtimeUs();
+                            std::string pong =
+                                "{\"type\":\"latency_pong\",\"client_send_ms\":\"" +
+                                client_send_ms + "\",\"server_recv_us\":\"" +
+                                std::to_string(server_recv_us) +
+                                "\",\"server_send_us\":\"" +
+                                std::to_string(server_send_us) + "\"}";
+                            sendToSignalWs(pong);
                         }
                     }
                 });
@@ -123,7 +140,9 @@ public:
 
     // 将 VPU 编码出的 H.265 NALU 发送给浏览器
     // 关键：为每帧设置正确的 RTP timestamp，避免浏览器抖动缓冲/播放时钟异常
-    bool pushFrame(const std::vector<uint8_t>& nalu, uint64_t pts_us) {
+    bool pushFrame(const std::vector<uint8_t>& nalu, uint64_t pts_us,
+                   uint64_t capture_realtime_us = 0,
+                   uint64_t sender_pipeline_us = 0) {
         // static FILE* fp_debug = fopen("/tmp/webrtc_debug.h265", "wb");
         // if (fp_debug && !nalu.empty()) fwrite(nalu.data(), 1, nalu.size(), fp_debug);
         
@@ -144,6 +163,7 @@ public:
         track->sendFrame(reinterpret_cast<const std::byte*>(nalu.data()),
                          nalu.size(),
                          rtc::FrameInfo(rtp_ts));
+        publishFrameTiming(rtp_ts, capture_realtime_us, sender_pipeline_us);
 
         if (m_sent_frames > 0) {
             const uint32_t rtp_step = rtp_ts - m_last_rtp_ts;
@@ -180,10 +200,52 @@ public:
     }
 
 private:
+    static uint64_t nowRealtimeUs() {
+        const auto now = std::chrono::system_clock::now();
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                         now.time_since_epoch())
+                                         .count());
+    }
+
+    void sendToSignalWs(const std::string& msg) {
+        std::shared_ptr<rtc::WebSocket> ws;
+        {
+            std::lock_guard<std::mutex> lock(m_ws_mutex);
+            ws = m_signal_ws;
+        }
+        if (!ws) {
+            return;
+        }
+        try {
+            ws->send(msg);
+        } catch (...) {
+            // 避免测量侧带消息影响主视频链路
+        }
+    }
+
+    void publishFrameTiming(uint32_t rtp_ts, uint64_t capture_realtime_us,
+                            uint64_t sender_pipeline_us) {
+        if (capture_realtime_us == 0) {
+            return;
+        }
+        const uint64_t send_realtime_us = nowRealtimeUs();
+        std::string msg = "{\"type\":\"frame_timing\",\"rtp_ts\":\"" +
+                          std::to_string(rtp_ts) +
+                          "\",\"capture_realtime_us\":\"" +
+                          std::to_string(capture_realtime_us) +
+                          "\",\"sender_pipeline_us\":\"" +
+                          std::to_string(sender_pipeline_us) +
+                          "\",\"send_realtime_us\":\"" +
+                          std::to_string(send_realtime_us) + "\"}";
+        sendToSignalWs(msg);
+    }
+
     std::shared_ptr<rtc::WebSocketServer> m_ws_server;
     std::shared_ptr<rtc::PeerConnection> m_pc;
     std::shared_ptr<rtc::Track> m_video_track;
     std::mutex m_track_mutex;
+    std::shared_ptr<rtc::WebSocket> m_signal_ws;
+    std::mutex m_ws_mutex;
     std::atomic<bool> m_need_keyframe{false};
     uint64_t m_sent_frames{0};
     uint32_t m_last_rtp_ts{0};

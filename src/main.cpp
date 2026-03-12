@@ -4,9 +4,11 @@
 #include "RgaProcessor.hpp"
 #include "WebRtcStreamer.hpp"
 #include <algorithm>
+#include <chrono>
 #include <fcntl.h>
 #include <iostream>
 #include <linux/videodev2.h>
+#include <limits>
 #include <optional>
 #include <string>
 #include <sys/ioctl.h>
@@ -26,6 +28,39 @@
 #define TARGET_FPS 30
 #define AI_DECODER_REV "ai-decode-r8-split"
 #define FACE_MODEL_PATH "/YoloFace/yolov8n-face-split-int8-lfw256.rknn"
+
+namespace {
+
+uint64_t nowRealtimeUs() {
+  const auto now = std::chrono::system_clock::now();
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch())
+          .count());
+}
+
+struct LatencyStats {
+  uint64_t count = 0;
+  uint64_t sum_us = 0;
+  uint64_t min_us = std::numeric_limits<uint64_t>::max();
+  uint64_t max_us = 0;
+  double ema_us = 0.0;
+
+  void add(uint64_t us) {
+    count++;
+    sum_us += us;
+    min_us = std::min(min_us, us);
+    max_us = std::max(max_us, us);
+    if (ema_us <= 0.0) {
+      ema_us = static_cast<double>(us);
+    } else {
+      ema_us = ema_us * 0.9 + static_cast<double>(us) * 0.1;
+    }
+  }
+
+  uint64_t avgUs() const { return (count == 0) ? 0 : (sum_us / count); }
+};
+
+} // namespace
 
 int main() {
   std::cout << "[INFO] EagleEye Pipeline: ISP(5MP) -> RGA(low-branch) -> "
@@ -124,6 +159,10 @@ int main() {
   uint64_t bad_pts_count = 0;
   double pts_delta_ema_us = 0.0;
   uint64_t pts_delta_samples = 0;
+  LatencyStats rga_latency;
+  LatencyStats enc_latency;
+  LatencyStats send_latency;
+  LatencyStats sender_pipeline_latency;
   while (true) {
     struct v4l2_buffer dqbuf = {};
     struct v4l2_plane dqplanes[1] = {};
@@ -133,6 +172,8 @@ int main() {
     dqbuf.m.planes = dqplanes;
 
     ioctl(cam_fd, VIDIOC_DQBUF, &dqbuf);
+    const auto frame_start_tp = std::chrono::steady_clock::now();
+    const uint64_t capture_realtime_us = nowRealtimeUs();
     int isp_idx = dqbuf.index;
     uint64_t v4l2_pts_us = static_cast<uint64_t>(dqbuf.timestamp.tv_sec) *
                                1000000ULL +
@@ -203,11 +244,18 @@ int main() {
       uint32_t rga_out_size = rgaPool.getBuffer(current_rga_idx).size;
 
       // [步骤 A] RGA 硬件剪裁 1080P
+      const auto rga_begin_tp = std::chrono::steady_clock::now();
       bool rga_ok =
           rga.cropAndScale(ispPool.getBuffer(isp_idx).fd, SRC_WIDTH, SRC_HEIGHT,
                            rga_out_fd, DST_WIDTH, DST_HEIGHT, crop_x, crop_y);
+      const auto rga_end_tp = std::chrono::steady_clock::now();
+      const uint64_t rga_us =
+          static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                    rga_end_tp - rga_begin_tp)
+                                    .count());
 
       if (rga_ok) {
+        rga_latency.add(rga_us);
         if (last_pts_us != 0) {
           uint64_t delta_pts_us = v4l2_pts_us - last_pts_us;
           if (pts_delta_ema_us <= 0.0) {
@@ -241,14 +289,37 @@ int main() {
         }
 
         // [步骤 B] 使用 V4L2 硬件捕获时间戳进行 MPP H.265 编码
+        const auto enc_begin_tp = std::chrono::steady_clock::now();
         std::vector<uint8_t> h265_nalu =
             encoder.encode(rga_out_fd, rga_out_size, v4l2_pts_us);
+        const auto enc_end_tp = std::chrono::steady_clock::now();
+        const uint64_t enc_us =
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                      enc_end_tp - enc_begin_tp)
+                                      .count());
+        enc_latency.add(enc_us);
 
         if (!h265_nalu.empty()) {
           // [步骤 C] 将 H.265 码流推送到 WebRTC 网络！
-          if (!streamer.pushFrame(h265_nalu, v4l2_pts_us)) {
+          const auto send_begin_tp = std::chrono::steady_clock::now();
+          const uint64_t sender_pipeline_us =
+              static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                        send_begin_tp - frame_start_tp)
+                                        .count());
+          if (!streamer.pushFrame(h265_nalu, v4l2_pts_us, capture_realtime_us,
+                                  sender_pipeline_us)) {
             send_fail_count++;
           }
+          const auto send_end_tp = std::chrono::steady_clock::now();
+          const uint64_t send_us =
+              static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                        send_end_tp - send_begin_tp)
+                                        .count());
+          send_latency.add(send_us);
+          sender_pipeline_latency.add(
+              static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                        send_end_tp - frame_start_tp)
+                                        .count()));
 
           if ((frame_count % 300) == 0) {
             std::cout << "\n[INFO] frame=" << frame_count
@@ -261,6 +332,15 @@ int main() {
                       << " send_fail=" << send_fail_count
                       << " cap_err=" << capture_err_count
                       << " bad_pts=" << bad_pts_count
+                      << " rga_us(avg/max)=" << rga_latency.avgUs() << "/"
+                      << rga_latency.max_us
+                      << " enc_us(avg/max)=" << enc_latency.avgUs() << "/"
+                      << enc_latency.max_us
+                      << " send_us(avg/max)=" << send_latency.avgUs() << "/"
+                      << send_latency.max_us
+                      << " sender_e2e_us(avg/ema)="
+                      << sender_pipeline_latency.avgUs() << "/"
+                      << static_cast<uint64_t>(sender_pipeline_latency.ema_us)
                       << " nalu_bytes=" << h265_nalu.size() << std::endl;
           }
         }
